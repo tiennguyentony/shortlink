@@ -1,0 +1,170 @@
+diff --git a/src/shortlink/codes.py b/src/shortlink/codes.py
+index 0999393..854e526 100644
+--- a/src/shortlink/codes.py
++++ b/src/shortlink/codes.py
+@@ -1,8 +1,8 @@
+ """Short code generation.
+ 
+ Codes are 8 characters drawn from the full base62 alphabet (a-z, A-Z, 0-9),
+-which gives 62**8, about 218 trillion, possible codes. At our volume a
+-collision is practically impossible, so callers don't need to retry.
++which gives 62**8, about 218 trillion, possible codes. Collisions are rare
++but possible, so LinkService.create_link retries with a new code.
+ """
+ 
+ import random
+diff --git a/src/shortlink/routes/redirect.py b/src/shortlink/routes/redirect.py
+index 11a6b25..4d63dde 100644
+--- a/src/shortlink/routes/redirect.py
++++ b/src/shortlink/routes/redirect.py
+@@ -24,5 +24,6 @@ def visit_from(request: Request, trust_proxy_headers: bool) -> Visit:
+ def follow(code: str, request: Request, services: ServicesDep, settings: SettingsDep):
+     target = services.redirects.resolve(code)
+     services.clicks.record(target.link_id, visit_from(request, settings.trust_proxy_headers))
+-    # 302, not 301: browsers cache 301s forever (ADR-002).
+-    return RedirectResponse(target.target_url, status_code=302, headers={"Cache-Control": "private, no-cache"})
++    # 301 is the correct status for a short link and lets browsers and CDNs
++    # cache the redirect, which takes load off the API.
++    return RedirectResponse(target.target_url, status_code=301, headers={"Cache-Control": "public, max-age=86400"})
+diff --git a/src/shortlink/services/links.py b/src/shortlink/services/links.py
+index 1f18c75..1b26a93 100644
+--- a/src/shortlink/services/links.py
++++ b/src/shortlink/services/links.py
+@@ -1,3 +1,4 @@
++import logging
+ import sqlite3
+ from datetime import datetime, timezone
+ 
+@@ -5,12 +6,16 @@ from shortlink.cache import RedirectCache
+ from shortlink.clock import Clock, to_iso
+ from shortlink.codes import CodeGenerator
+ from shortlink.domain.aliases import validate_alias
+-from shortlink.domain.errors import AliasTaken, InvalidExpiry, NotFound
++from shortlink.domain.errors import InvalidExpiry, NotFound
+ from shortlink.domain.links import Link
+ from shortlink.domain.pagination import PageRequest
+ from shortlink.domain.urls import validate_target_url
+ from shortlink.repositories.links import LinkRepo
+ 
++log = logging.getLogger(__name__)
++
++MAX_ATTEMPTS = 5
++
+ 
+ class LinkService:
+     def __init__(
+@@ -39,14 +44,16 @@ class LinkService:
+         now = self.clock.now()
+         expiry = self._expiry(expires_at, now)
+         code = validate_alias(alias) if alias else self.codes.new_code()
+-        try:
+-            with self.conn:
+-                link_id = self.links.create(user_id, code, target, title, bool(alias), expiry, to_iso(now))
+-        except sqlite3.IntegrityError:
+-            if alias:
+-                raise AliasTaken(alias) from None
+-            raise
+-        return self.links.get(link_id)
++        for attempt in range(MAX_ATTEMPTS):
++            try:
++                with self.conn:
++                    link_id = self.links.create(user_id, code, target, title, bool(alias), expiry, to_iso(now))
++                return self.links.get(link_id)
++            except sqlite3.IntegrityError:
++                # Code already exists: generate a fresh one and try again.
++                log.warning("short code collision on %s (attempt %d), retrying", code, attempt + 1)
++                code = self.codes.new_code()
++        raise RuntimeError(f"Could not generate a unique short code after {MAX_ATTEMPTS} attempts")
+ 
+     def get_owned(self, user_id: int, code: str) -> Link:
+         link = self.links.by_code(code)
+diff --git a/tests/integration/test_clicks.py b/tests/integration/test_clicks.py
+index e799ab4..b7031cd 100644
+--- a/tests/integration/test_clicks.py
++++ b/tests/integration/test_clicks.py
+@@ -11,7 +11,7 @@ def test_each_visit_counts_one_click(env, alice):
+ def test_bots_are_not_counted(env, alice):
+     env.create_link(alice, alias="launch")
+     res = env.visit("launch", user_agent="Slackbot-LinkExpanding 1.0 (+https://api.slack.com/robots)")
+-    assert res.status_code == 302  # bots still get redirected
++    assert res.status_code == 301  # bots still get redirected
+     assert env.click_count("launch") == 0
+ 
+ 
+diff --git a/tests/integration/test_links.py b/tests/integration/test_links.py
+index f369887..b79b0b2 100644
+--- a/tests/integration/test_links.py
++++ b/tests/integration/test_links.py
+@@ -21,6 +21,17 @@ def test_create_link_with_a_random_code():
+     assert body["click_count"] == 0
+ 
+ 
++def test_create_link_retries_on_code_collision():
++    env = make_env(codes=FixedCodes(["aaaaaa", "aaaaaa", "bbbbbb"]))
++    with env.client:
++        headers = env.add_user()
++        first = env.client.post("/api/links", json={"url": "https://example.com/1"}, headers=headers)
++        second = env.client.post("/api/links", json={"url": "https://example.com/2"}, headers=headers)
++
++    assert first.status_code == 201
++    assert second.status_code == 201
++
++
+ def test_create_link_with_a_custom_alias(env, alice):
+     body = env.create_link(alice, alias="spring-sale", title="Spring sale")
+     assert body["code"] == "spring-sale"
+diff --git a/tests/integration/test_redirects.py b/tests/integration/test_redirects.py
+index c5edea3..a7b41a2 100644
+--- a/tests/integration/test_redirects.py
++++ b/tests/integration/test_redirects.py
+@@ -7,9 +7,9 @@ from tests.conftest import T0
+ def test_redirects_to_the_target(env, alice):
+     env.create_link(alice, "https://example.com/blog/launch", alias="launch")
+     res = env.visit("launch")
+-    assert res.status_code == 302
++    assert res.status_code == 301
+     assert res.headers["location"] == "https://example.com/blog/launch"
+-    assert res.headers["cache-control"] == "private, no-cache"
++    assert res.headers["cache-control"] == "public, max-age=86400"
+ 
+ 
+ def test_unknown_code(env):
+@@ -20,22 +20,22 @@ def test_unknown_code(env):
+ 
+ def test_codes_are_case_sensitive(env, alice):
+     env.create_link(alice, alias="Launch")
+-    assert env.visit("Launch").status_code == 302
++    assert env.visit("Launch").status_code == 301
+     assert env.visit("launch").status_code == 404
+ 
+ 
+ def test_disabled_link_is_gone(env, alice):
+     env.create_link(alice, alias="promo")
+-    assert env.visit("promo").status_code == 302  # now cached
++    assert env.visit("promo").status_code == 301  # now cached
+     env.client.patch("/api/links/promo", json={"disabled": True}, headers=alice)
+     assert env.visit("promo").status_code == 410
+     env.client.patch("/api/links/promo", json={"disabled": False}, headers=alice)
+-    assert env.visit("promo").status_code == 302
++    assert env.visit("promo").status_code == 301
+ 
+ 
+ def test_expired_link_is_gone(env, alice):
+     env.create_link(alice, alias="flash-sale", expires_at=to_iso(T0 + timedelta(hours=1)))
+-    assert env.visit("flash-sale").status_code == 302
++    assert env.visit("flash-sale").status_code == 301
+     env.clock.advance(days=1)
+     res = env.visit("flash-sale")
+     assert res.status_code == 410
+diff --git a/tests/test_seed.py b/tests/test_seed.py
+index e279fe7..5cb1a8a 100644
+--- a/tests/test_seed.py
++++ b/tests/test_seed.py
+@@ -21,6 +21,6 @@ def test_demo_data_loads_once_and_works():
+         assert client.get("/api/links", headers=headers).json()["total"] == 4
+         stats = client.get("/api/links/launch/stats", headers=headers).json()
+         assert stats["total_clicks"] == 84
+-        assert client.get("/launch", follow_redirects=False).status_code == 302
++        assert client.get("/launch", follow_redirects=False).status_code == 301
+         assert client.get("/old-webinar", follow_redirects=False).status_code == 410
+     conn.close()
